@@ -77,6 +77,47 @@ def current_bodyweight() -> float | None:
     return sorted(pomiary, key=lambda x: x.get("data", ""))[-1].get("pomiar_kg")
 
 
+def bodyweight_series() -> pd.DataFrame | None:
+    """Zwraca DataFrame z kolumnami date i bw_kg posortowany po dacie."""
+    raw = st.session_state.get("pomiary", {})
+    pomiary = raw.get("pomiary", [])
+    if not pomiary:
+        return None
+    df = pd.DataFrame(pomiary)[["data", "pomiar_kg"]].rename(
+        columns={"data": "date", "pomiar_kg": "bw_kg"}
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def merge_bodyweight(df: pd.DataFrame, bw_fallback: float, male: bool) -> pd.DataFrame:
+    """
+    Dla każdego wiersza df (musi mieć kolumnę 'date') przypisuje masę ciała
+    z pomiaru najbliższego w czasie (merge_asof backward).
+    Jeśli brak pomiary.json — używa bw_fallback dla wszystkich dat.
+    Dodaje kolumny 'bw_kg' i 'wilks'.
+    """
+    df = df.copy()
+    bw_df = bodyweight_series()
+
+    if bw_df is not None:
+        df_sorted = df.sort_values("date")
+        merged = pd.merge_asof(
+            df_sorted,
+            bw_df,
+            on="date",
+            direction="nearest",
+        )
+        df = merged.sort_values("date")
+    else:
+        df["bw_kg"] = bw_fallback
+
+    df["wilks"] = df.apply(
+        lambda r: wilks_points(r["max_1rm"], r["bw_kg"], male), axis=1
+    )
+    return df
+
+
 # ── dane ───────────────────────────────────────────────────────────────────
 
 all_sets = query("""
@@ -245,11 +286,10 @@ with tab2:
 # ── Wilks trend ────────────────────────────────────────────────────────────
 
 st.divider()
-st.subheader(f"Wilks Points w czasie  ·  masa ciała: {bw:.1f} kg")
+bw_source = "z pomiary.json (per data)" if bodyweight_series() is not None else f"stała: {bw:.1f} kg (brak pomiary.json)"
+st.subheader(f"Wilks Points w czasie  ·  masa ciała {bw_source}")
 
-per_day_all["wilks"] = per_day_all["max_1rm"].apply(
-    lambda x: wilks_points(x, bw, male)
-)
+per_day_all = merge_bodyweight(per_day_all, bw, male)
 
 fig_wilks = px.line(
     per_day_all, x="date", y="wilks", color="exercise",
@@ -308,7 +348,17 @@ if len(selected) == 1:
         .assign(Data=lambda d: d["Data"].dt.date)
     )
     top10["Est. 1RM (kg)"] = top10["Est. 1RM (kg)"].round(1)
-    top10["Wilks"] = top10["Est. 1RM (kg)"].apply(
-        lambda x: round(wilks_points(x, bw, male), 1)
-    )
+    bw_s = bodyweight_series()
+    top10_dates = pd.to_datetime(top10["Data"]).sort_values()
+    if bw_s is not None:
+        top10_bw = pd.merge_asof(
+            pd.DataFrame({"date": top10_dates}),
+            bw_s, on="date", direction="nearest",
+        )["bw_kg"].values
+    else:
+        top10_bw = [bw] * len(top10)
+    top10["Wilks"] = [
+        round(wilks_points(rm, w, male), 1)
+        for rm, w in zip(top10["Est. 1RM (kg)"], top10_bw)
+    ]
     st.dataframe(top10, use_container_width=True, hide_index=True)
