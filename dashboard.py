@@ -393,77 +393,10 @@ if not vol_data.empty:
     st.plotly_chart(fig_vol, use_container_width=True)
     st.caption(f"Łączny wolumen wszystkich treningów: {total_volume_kg:,.0f} kg")
 
-# ── analiza ćwiczeń ────────────────────────────────────────────────────────
+# ── analiza ćwiczeń — link do osobnej strony ──────────────────────────────
 
 st.divider()
-st.subheader("Analiza ćwiczeń")
-
-filtered_ids   = workouts["id"].tolist()
-id_placeholders = ",".join("?" * len(filtered_ids))
-
-ex_sets = query(f"""
-    SELECT COALESCE(s.exercise_name_pl, s.exercise_name) AS exercise,
-           s.weight_kg, s.repetitions, s.volume_kg,
-           DATE(w.start_time) AS date
-    FROM sets s
-    JOIN workouts w ON w.id = s.workout_id
-    WHERE s.set_type = 'active'
-      AND s.weight_kg IS NOT NULL AND s.weight_kg > 0
-      AND w.id IN ({id_placeholders})
-    ORDER BY w.start_time
-""", tuple(filtered_ids))
-
-if ex_sets.empty:
-    st.info("Brak danych o seriach w wybranym zakresie dat.")
-else:
-    ex_sets["date"] = pd.to_datetime(ex_sets["date"])
-
-    ex_frequency = (
-        ex_sets.groupby("exercise")["date"]
-        .nunique().reset_index(name="sessions")
-        .sort_values("sessions", ascending=False)
-    )
-
-    st.sidebar.divider()
-    st.sidebar.subheader("Ćwiczenia")
-    min_sessions = st.sidebar.slider(
-        "Min. sesji (odsiewa akcesoryjne)",
-        min_value=1,
-        max_value=max(ex_frequency["sessions"].max(), 2),
-        value=max(ex_frequency["sessions"].max() // 3, 2),
-    )
-
-    main_exercises = ex_frequency[ex_frequency["sessions"] >= min_sessions]["exercise"].tolist()
-
-    selected_exercises = st.multiselect(
-        "Wybierz ćwiczenia do analizy",
-        options=main_exercises,
-        default=main_exercises[:min(5, len(main_exercises))],
-        placeholder="Wybierz ćwiczenia...",
-    )
-
-    if selected_exercises:
-        ex_filtered = ex_sets[ex_sets["exercise"].isin(selected_exercises)]
-        max_weight  = (
-            ex_filtered.groupby(["exercise", "date"])["weight_kg"]
-            .max().reset_index()
-        )
-        fig_ex = px.line(
-            max_weight, x="date", y="weight_kg", color="exercise",
-            markers=True,
-            labels={"date": "Data", "weight_kg": "Maks. ciężar (kg)", "exercise": "Ćwiczenie"},
-            title="Progres ciężarów",
-        )
-        fig_ex.update_layout(height=420, legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(fig_ex, use_container_width=True)
-
-        st.markdown("**Trend ciężaru (1. vs 2. połowa okresu)**")
-        trend_cols = st.columns(len(selected_exercises))
-        for col, ex_name in zip(trend_cols, selected_exercises):
-            series    = max_weight[max_weight["exercise"] == ex_name]["weight_kg"]
-            delta, direction = trend_delta(series)
-            last_val  = series.iloc[-1] if not series.empty else 0
-            col.metric(ex_name, f"{last_val:.1f} kg", delta=delta, delta_color=direction or "normal")
+st.info("Szczegółowa analiza ćwiczeń (rekordy, 1RM, wskaźnik siły) dostępna na stronie **Ćwiczenia** w menu po lewej.")
 
 # ── dieta (Fitatu) ─────────────────────────────────────────────────────────
 
