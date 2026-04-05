@@ -143,6 +143,17 @@ selected = st.sidebar.multiselect(
 st.sidebar.divider()
 male = st.sidebar.radio("Płeć (Wilks)", ["Mężczyzna", "Kobieta"], index=0) == "Mężczyzna"
 
+bw_from_file = current_bodyweight()
+if bw_from_file:
+    st.sidebar.caption(f"Masa ciała z pomiary.json: **{bw_from_file:.1f} kg**")
+bw_manual = st.sidebar.number_input(
+    "Masa ciała (kg)",
+    min_value=40.0, max_value=200.0,
+    value=float(bw_from_file) if bw_from_file else 80.0,
+    step=0.5,
+    help="Używana do Wilks Points i wskaźnika siły",
+)
+
 if not selected:
     st.info("Wybierz co najmniej jedno ćwiczenie w menu po lewej.")
     st.stop()
@@ -160,7 +171,7 @@ if ex.empty:
     st.warning("Brak danych dla wybranych ćwiczeń w tym zakresie dat.")
     st.stop()
 
-bw = current_bodyweight()
+bw = bw_manual
 
 # ── nagłówek ───────────────────────────────────────────────────────────────
 
@@ -187,18 +198,17 @@ for col, ex_name in zip(cols, selected):
     col.metric("Est. 1RM",     f"{pr_1rm:.1f} kg",
                help="Wzór Epley'a: w × (1 + r/30)")
 
-    if bw:
-        ratio = pr_1rm / bw
-        col.metric("Siła / masa ciała", f"{ratio:.2f}×")
+    ratio = pr_1rm / bw
+    col.metric("Siła / masa ciała", f"{ratio:.2f}×")
 
-        w_pts = wilks_points(pr_1rm, bw, male)
-        col.metric(
-            "Wilks Points",
-            f"{w_pts:.1f}",
-            delta=wilks_level(w_pts),
-            delta_color="off",
-            help="Wilks = 1RM × 500 / W(masa_ciała). Porównuje siłę między różnymi wagami ciała.",
-        )
+    w_pts = wilks_points(pr_1rm, bw, male)
+    col.metric(
+        "Wilks Points",
+        f"{w_pts:.1f}",
+        delta=wilks_level(w_pts),
+        delta_color="off",
+        help="Wilks = 1RM × 500 / W(masa_ciała). Porównuje siłę między różnymi wagami ciała.",
+    )
 
 st.divider()
 
@@ -232,33 +242,31 @@ with tab2:
     fig_1rm.update_layout(height=360, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
     st.plotly_chart(fig_1rm, use_container_width=True)
 
-# ── Wilks trend (jeśli jest masa ciała) ───────────────────────────────────
+# ── Wilks trend ────────────────────────────────────────────────────────────
 
-if bw:
-    st.divider()
-    st.subheader(f"Wilks Points w czasie  ·  masa ciała: {bw:.1f} kg")
+st.divider()
+st.subheader(f"Wilks Points w czasie  ·  masa ciała: {bw:.1f} kg")
 
-    per_day_all["wilks"] = per_day_all["max_1rm"].apply(
-        lambda x: wilks_points(x, bw, male)
+per_day_all["wilks"] = per_day_all["max_1rm"].apply(
+    lambda x: wilks_points(x, bw, male)
+)
+
+fig_wilks = px.line(
+    per_day_all, x="date", y="wilks", color="exercise",
+    markers=True,
+    labels={"date": "Data", "wilks": "Wilks Points", "exercise": "Ćwiczenie"},
+)
+
+for poziom, val in [("Amator", 250), ("Zaawansowany", 450), ("Elita", 550)]:
+    fig_wilks.add_hline(
+        y=val, line_dash="dash", line_color="rgba(255,255,255,0.2)",
+        annotation_text=poziom, annotation_position="right",
     )
 
-    fig_wilks = px.line(
-        per_day_all, x="date", y="wilks", color="exercise",
-        markers=True,
-        labels={"date": "Data", "wilks": "Wilks Points", "exercise": "Ćwiczenie"},
-    )
+fig_wilks.update_layout(height=340, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
+st.plotly_chart(fig_wilks, use_container_width=True)
 
-    # Linie poziomów
-    for poziom, val in [("Amator", 250), ("Zaawansowany", 450), ("Elita", 550)]:
-        fig_wilks.add_hline(
-            y=val, line_dash="dash", line_color="rgba(255,255,255,0.2)",
-            annotation_text=poziom, annotation_position="right",
-        )
-
-    fig_wilks.update_layout(height=340, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
-    st.plotly_chart(fig_wilks, use_container_width=True)
-
-# ── wolumen i szczegóły (tylko jedno ćwiczenie) ───────────────────────────
+# ── wolumen i szczegóły (tylko jedno ćwiczenie) ────────────────────────────
 
 if len(selected) == 1:
     ex_name = selected[0]
@@ -300,8 +308,7 @@ if len(selected) == 1:
         .assign(Data=lambda d: d["Data"].dt.date)
     )
     top10["Est. 1RM (kg)"] = top10["Est. 1RM (kg)"].round(1)
-    if bw:
-        top10["Wilks"] = top10["Est. 1RM (kg)"].apply(
-            lambda x: round(wilks_points(x, bw, male), 1)
-        )
+    top10["Wilks"] = top10["Est. 1RM (kg)"].apply(
+        lambda x: round(wilks_points(x, bw, male), 1)
+    )
     st.dataframe(top10, use_container_width=True, hide_index=True)
