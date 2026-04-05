@@ -293,13 +293,19 @@ def sidebar_upload_extra():
         w_kg   = st.number_input("Waga (kg)", min_value=30.0, max_value=250.0,
                                   value=80.0, step=0.1, key="w_kg")
         if st.button("Zapisz wagę", key="w_save"):
-            st.session_state.conn.execute(
-                "INSERT OR REPLACE INTO weight (date, weight_kg) VALUES (?,?)",
-                (str(w_date), w_kg),
-            )
-            st.session_state.conn.commit()
-            st.sidebar.success(f"Zapisano: {w_date} → {w_kg:.1f} kg")
+            try:
+                st.session_state.conn.execute(
+                    "INSERT OR REPLACE INTO weight (date, weight_kg) VALUES (?,?)",
+                    (str(w_date), w_kg),
+                )
+                st.session_state.conn.commit()
+                st.session_state["w_saved_msg"] = f"Zapisano: {w_date} → {w_kg:.1f} kg"
+            except Exception as e:
+                st.sidebar.error(f"Błąd zapisu: {e}")
             st.rerun()
+
+    if st.session_state.get("w_saved_msg"):
+        st.sidebar.success(st.session_state.pop("w_saved_msg"))
 
     st.sidebar.divider()
 
@@ -551,14 +557,7 @@ if waga.empty:
     st.info("Brak danych wagi. Wgraj plik `pomiary.json` z Fitatu lub dodaj ręcznie (⚖️ w sidebarze).")
 else:
     waga["date"] = pd.to_datetime(waga["date"])
-    waga = waga[
-        (waga["date"].dt.date >= date_from) &
-        (waga["date"].dt.date <= date_to)
-    ]
-
-    if waga.empty:
-        st.info("Brak danych wagi w wybranym zakresie dat.")
-    else:
+    if True:
         first_kg = waga["weight_kg"].iloc[0]
         last_kg  = waga["weight_kg"].iloc[-1]
         total_ch = last_kg - first_kg
