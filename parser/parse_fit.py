@@ -61,6 +61,19 @@ def init_db(conn):
             distance_m REAL
         );
 
+        CREATE TABLE IF NOT EXISTS weight (
+            date      TEXT PRIMARY KEY,
+            weight_kg REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS diet (
+            date    TEXT PRIMARY KEY,
+            kcal    REAL,
+            protein REAL,
+            fat     REAL,
+            carbs   REAL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sets_workout    ON sets(workout_id);
         CREATE INDEX IF NOT EXISTS idx_sets_exercise   ON sets(exercise_name);
         CREATE INDEX IF NOT EXISTS idx_hr_workout      ON heart_rate(workout_id);

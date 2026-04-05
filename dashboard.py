@@ -4,8 +4,10 @@ Wgraj pliki .fit aby zobaczyć analizę treningów
 """
 
 import json
+import os
 import sqlite3
 import sys
+import tempfile
 from io import BytesIO
 from pathlib import Path
 
@@ -39,10 +41,8 @@ def init_session():
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         _init_workout_db(conn)
         _init_monitor_db(conn)
-        st.session_state.conn       = conn
-        st.session_state.processed  = set()
-        st.session_state.fitatu_df  = pd.DataFrame()
-        st.session_state.pomiary    = {}
+        st.session_state.conn      = conn
+        st.session_state.processed = set()
 
 init_session()
 
@@ -54,6 +54,35 @@ def has_workouts():
         return query("SELECT COUNT(*) AS n FROM workouts").iloc[0]["n"] > 0
     except Exception:
         return False
+
+
+# ── eksport / import bazy ──────────────────────────────────────────────────
+
+def export_db_bytes(conn: sqlite3.Connection) -> bytes:
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    dest = sqlite3.connect(tmp.name)
+    conn.backup(dest)
+    dest.close()
+    with open(tmp.name, "rb") as f:
+        data = f.read()
+    os.unlink(tmp.name)
+    return data
+
+
+def load_db_from_bytes(data: bytes) -> sqlite3.Connection:
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(data)
+    tmp.close()
+    src = sqlite3.connect(tmp.name)
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    src.backup(conn)
+    src.close()
+    os.unlink(tmp.name)
+    # upewnij się że wszystkie tabele istnieją (starsze pliki .db)
+    _init_workout_db(conn)
+    _init_monitor_db(conn)
+    return conn
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -148,24 +177,31 @@ def process_uploads(fit_files, xls_files, json_file):
     if added_monitors > 0:
         aggregate_daily(st.session_state.conn)
 
-    new_dfs = []
     for f in (xls_files or []):
         if f.name in st.session_state.processed:
             continue
         df = parse_fitatu_bytes(f.read())
         if not df.empty:
-            new_dfs.append(df)
+            for _, row in df.iterrows():
+                st.session_state.conn.execute(
+                    "INSERT OR REPLACE INTO diet (date, kcal, protein, fat, carbs) VALUES (?,?,?,?,?)",
+                    (row["date"].strftime("%Y-%m-%d"), row["kcal"], row["protein"], row["fat"], row["carbs"]),
+                )
+            st.session_state.conn.commit()
         st.session_state.processed.add(f.name)
-
-    if new_dfs:
-        combined = pd.concat([st.session_state.fitatu_df] + new_dfs)
-        st.session_state.fitatu_df = (
-            combined.drop_duplicates(subset=["date"]).sort_values("date")
-        )
 
     if json_file and json_file.name not in st.session_state.processed:
         try:
-            st.session_state.pomiary = json.loads(json_file.read())
+            raw = json.loads(json_file.read())
+            for item in raw.get("pomiary", []):
+                date = item.get("data")
+                kg   = item.get("pomiar_kg")
+                if date and kg:
+                    st.session_state.conn.execute(
+                        "INSERT OR REPLACE INTO weight (date, weight_kg) VALUES (?,?)",
+                        (date, float(kg)),
+                    )
+            st.session_state.conn.commit()
             st.session_state.processed.add(json_file.name)
         except Exception as e:
             errors.append(f"{json_file.name}: {e}")
@@ -176,9 +212,31 @@ def process_uploads(fit_files, xls_files, json_file):
 
 def show_upload_page():
     st.title("💪 Garmin Dashboard")
-    st.markdown("Wgraj pliki z zegarka Garmin aby zobaczyć analizę treningów.")
     st.markdown("---")
 
+    # ── opcja A: wgraj zapisaną bazę danych ──
+    st.markdown("#### Opcja A — wgraj zapisaną bazę danych")
+    db_file = st.file_uploader(
+        "Plik `garmin_dashboard.db` z poprzedniej sesji",
+        type=["db"],
+        key="up_db_main",
+    )
+    if st.button("▶ Załaduj bazę", type="primary", disabled=not db_file):
+        with st.spinner("Ładowanie bazy..."):
+            conn = load_db_from_bytes(db_file.read())
+        st.session_state.conn = conn
+        # odtwórz listę już przetworzonych plików z bazy
+        try:
+            names = pd.read_sql_query("SELECT file_name FROM workouts", conn)["file_name"].tolist()
+            st.session_state.processed = set(names)
+        except Exception:
+            st.session_state.processed = set()
+        st.rerun()
+
+    st.markdown("---")
+
+    # ── opcja B: wgraj pliki od zera ──
+    st.markdown("#### Opcja B — wgraj pliki z Garmina")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("##### Treningi / monitoring")
@@ -205,7 +263,7 @@ def show_upload_page():
         )
 
     st.markdown("")
-    if st.button("▶ Analizuj", type="primary", disabled=not fit_files):
+    if st.button("▶ Analizuj", type="secondary", disabled=not fit_files):
         with st.spinner("Parsowanie plików..."):
             w, m, errs = process_uploads(fit_files, xls_files, json_file)
         for e in errs:
@@ -230,7 +288,31 @@ def sidebar_upload_extra():
             if w + m > 0:
                 st.rerun()
 
-    if st.sidebar.button("Wyczyść dane i zacznij od nowa", type="secondary"):
+    with st.sidebar.expander("⚖️ Dodaj wagę"):
+        w_date = st.date_input("Data", value=pd.Timestamp.today().date(), key="w_date")
+        w_kg   = st.number_input("Waga (kg)", min_value=30.0, max_value=250.0,
+                                  value=80.0, step=0.1, key="w_kg")
+        if st.button("Zapisz wagę", key="w_save"):
+            st.session_state.conn.execute(
+                "INSERT OR REPLACE INTO weight (date, weight_kg) VALUES (?,?)",
+                (str(w_date), w_kg),
+            )
+            st.session_state.conn.commit()
+            st.sidebar.success(f"Zapisano: {w_date} → {w_kg:.1f} kg")
+            st.rerun()
+
+    st.sidebar.divider()
+
+    db_bytes = export_db_bytes(st.session_state.conn)
+    st.sidebar.download_button(
+        "💾 Eksportuj bazę danych",
+        data=db_bytes,
+        file_name="garmin_dashboard.db",
+        mime="application/octet-stream",
+        use_container_width=True,
+    )
+
+    if st.sidebar.button("Wyczyść dane i zacznij od nowa", type="secondary", use_container_width=True):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
@@ -403,11 +485,12 @@ st.info("Szczegółowa analiza ćwiczeń (rekordy, 1RM, wskaźnik siły) dostęp
 st.divider()
 st.subheader("Dieta (Fitatu)")
 
-diet = st.session_state.fitatu_df
+diet = query("SELECT date, kcal, protein, fat, carbs FROM diet ORDER BY date")
 
 if diet.empty:
     st.info("Brak danych diety. Wgraj pliki .xls z Fitatu.")
 else:
+    diet["date"] = pd.to_datetime(diet["date"])
     diet = diet[
         (diet["date"].dt.date >= date_from) &
         (diet["date"].dt.date <= date_to)
@@ -457,54 +540,42 @@ else:
         fig_macro.update_layout(height=320, legend=dict(orientation="h", y=-0.2))
         st.plotly_chart(fig_macro, use_container_width=True)
 
-# ── waga (Fitatu) ──────────────────────────────────────────────────────────
+# ── waga ───────────────────────────────────────────────────────────────────
 
 st.divider()
 st.subheader("Waga")
 
-raw = st.session_state.pomiary
-if not raw:
-    st.info("Brak danych wagi. Wgraj plik `pomiary.json` z Fitatu.")
+waga = query("SELECT date, weight_kg FROM weight ORDER BY date")
+
+if waga.empty:
+    st.info("Brak danych wagi. Wgraj plik `pomiary.json` z Fitatu lub dodaj ręcznie (⚖️ w sidebarze).")
 else:
-    cel_roznica = raw.get("cel", {}).get("roznica_kg", None)
-    cel_dni     = raw.get("cel", {}).get("prognoza_osiagniecia_dni", None)
+    waga["date"] = pd.to_datetime(waga["date"])
+    waga = waga[
+        (waga["date"].dt.date >= date_from) &
+        (waga["date"].dt.date <= date_to)
+    ]
 
-    pomiary = pd.DataFrame(raw.get("pomiary", []))
-    pomiary["date"] = pd.to_datetime(pomiary["data"])
-    pomiary = pomiary.sort_values("date")
+    if waga.empty:
+        st.info("Brak danych wagi w wybranym zakresie dat.")
+    else:
+        first_kg = waga["weight_kg"].iloc[0]
+        last_kg  = waga["weight_kg"].iloc[-1]
+        total_ch = last_kg - first_kg
 
-    first_kg = pomiary["pomiar_kg"].iloc[0]
-    last_kg  = pomiary["pomiar_kg"].iloc[-1]
-    total_ch = last_kg - first_kg
-    cel_kg   = first_kg + cel_roznica if cel_roznica is not None else None
+        w1, w2 = st.columns(2)
+        w1.metric("Aktualna waga", f"{last_kg:.1f} kg",
+                  delta=f"{total_ch:+.1f} kg od początku", delta_color="inverse")
+        w2.metric("Liczba pomiarów", str(len(waga)))
 
-    w1, w2, w3, w4 = st.columns(4)
-    w1.metric("Aktualna waga", f"{last_kg:.1f} kg",
-              delta=f"{total_ch:+.1f} kg od początku", delta_color="inverse")
-    w2.metric("Zmiana ostatni pomiar",
-              f"{pomiary['zmiana_kg'].iloc[-1]:+.1f} kg", delta_color="inverse")
-    if cel_kg is not None:
-        pozostalo = last_kg - cel_kg
-        w3.metric("Cel", f"{cel_kg:.1f} kg",
-                  delta=f"{pozostalo:+.1f} kg do celu", delta_color="inverse")
-    if cel_dni is not None:
-        w4.metric("Prognoza osiągnięcia celu", f"{cel_dni} dni")
-
-    fig_waga = px.line(
-        pomiary, x="date", y="pomiar_kg", markers=True,
-        title="Historia wagi",
-        labels={"date": "Data", "pomiar_kg": "Waga (kg)"},
-        color_discrete_sequence=["#e67e22"],
-    )
-    if cel_kg is not None:
-        fig_waga.add_hline(
-            y=cel_kg, line_dash="dot",
-            annotation_text=f"cel {cel_kg:.1f} kg",
-            annotation_position="bottom right",
-            line_color="rgba(46,204,113,0.6)",
+        fig_waga = px.line(
+            waga, x="date", y="weight_kg", markers=True,
+            title="Historia wagi",
+            labels={"date": "Data", "weight_kg": "Waga (kg)"},
+            color_discrete_sequence=["#e67e22"],
         )
-    fig_waga.update_layout(height=320)
-    st.plotly_chart(fig_waga, use_container_width=True)
+        fig_waga.update_layout(height=320)
+        st.plotly_chart(fig_waga, use_container_width=True)
 
 # ── aktywność dzienna ──────────────────────────────────────────────────────
 

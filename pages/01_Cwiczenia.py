@@ -63,23 +63,32 @@ def best_1rm_row(df: pd.DataFrame):
 
 
 def current_bodyweight() -> float | None:
-    raw = st.session_state.get("pomiary", {})
-    pomiary = raw.get("pomiary", [])
-    if not pomiary:
+    conn = st.session_state.get("conn")
+    if conn is None:
         return None
-    return sorted(pomiary, key=lambda x: x.get("data", ""))[-1].get("pomiar_kg")
+    try:
+        row = conn.execute(
+            "SELECT weight_kg FROM weight ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        return float(row[0]) if row else None
+    except Exception:
+        return None
 
 
 def bodyweight_series() -> pd.DataFrame | None:
-    raw = st.session_state.get("pomiary", {})
-    pomiary = raw.get("pomiary", [])
-    if not pomiary:
+    conn = st.session_state.get("conn")
+    if conn is None:
         return None
-    df = pd.DataFrame(pomiary)[["data", "pomiar_kg"]].rename(
-        columns={"data": "date", "pomiar_kg": "bw_kg"}
-    )
-    df["date"] = pd.to_datetime(df["date"])
-    return df.sort_values("date").reset_index(drop=True)
+    try:
+        df = pd.read_sql_query(
+            "SELECT date, weight_kg AS bw_kg FROM weight ORDER BY date", conn
+        )
+        if df.empty:
+            return None
+        df["date"] = pd.to_datetime(df["date"])
+        return df.reset_index(drop=True)
+    except Exception:
+        return None
 
 
 def merge_bodyweight(df: pd.DataFrame, bw_fallback: float, male: bool) -> pd.DataFrame:
@@ -203,13 +212,13 @@ male = st.sidebar.radio("Płeć (Wilks)", ["Mężczyzna", "Kobieta"], index=0) =
 
 bw_from_file = current_bodyweight()
 if bw_from_file:
-    st.sidebar.caption(f"Masa ciała z pomiary.json: **{bw_from_file:.1f} kg**")
+    st.sidebar.caption(f"Masa ciała z bazy danych: **{bw_from_file:.1f} kg**")
 bw_manual = st.sidebar.number_input(
     "Masa ciała (kg)",
     min_value=40.0, max_value=200.0,
     value=float(bw_from_file) if bw_from_file else 80.0,
     step=0.5,
-    help="Używana gdy brak pomiary.json lub jako nadpisanie",
+    help="Używana gdy brak bazy danych lub jako nadpisanie",
 )
 
 if not selected:
@@ -332,7 +341,7 @@ with tab_1rm:
     st.plotly_chart(zoomed_chart(fig), use_container_width=True)
 
 with tab_pct:
-    bw_source = "per data (pomiary.json)" if bodyweight_series() is not None else f"stała {bw:.1f} kg"
+    bw_source = "per data (bazy danych)" if bodyweight_series() is not None else f"stała {bw:.1f} kg"
     st.caption(f"Est. 1RM jako % masy ciała ({bw_source}). 100% = ciężar równy masie ciała.")
     fig = px.line(per_day_all, x="date", y="pct_bw", color="exercise", markers=True,
                   labels={"date": "Data", "pct_bw": "1RM / masa ciała (%)", "exercise": "Ćwiczenie"})
@@ -342,7 +351,7 @@ with tab_pct:
     st.plotly_chart(zoomed_chart(fig), use_container_width=True)
 
 with tab_wilks:
-    bw_source = "per data (pomiary.json)" if bodyweight_series() is not None else f"stała {bw:.1f} kg"
+    bw_source = "per data (bazy danych)" if bodyweight_series() is not None else f"stała {bw:.1f} kg"
     st.caption(f"Masa ciała: {bw_source}. Wyższa wartość = lepsza siła względna.")
     fig = px.line(per_day_all, x="date", y="wilks", color="exercise", markers=True,
                   labels={"date": "Data", "wilks": "Wilks Points", "exercise": "Ćwiczenie"})
