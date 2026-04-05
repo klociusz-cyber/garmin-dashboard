@@ -24,17 +24,12 @@ def query(sql, params=()):
 # ── formuły siłowe ─────────────────────────────────────────────────────────
 
 def epley_1rm(weight: float, reps: int) -> float:
-    """Wzór Epley'a: 1RM = w × (1 + r/30)"""
     if reps <= 0:
         return 0.0
     return float(weight) if reps == 1 else weight * (1 + reps / 30)
 
 
 def wilks_points(lift_kg: float, bw_kg: float, male: bool = True) -> float:
-    """
-    Wilks Points — klasyczny standard siłowy normalizowany względem masy ciała.
-    Źródło: Robert Wilks, IPF (stosowany do 2019).
-    """
     if male:
         a, b, c, d, e, f = (
             -216.0475144, 16.2606339, -0.002388645,
@@ -47,17 +42,15 @@ def wilks_points(lift_kg: float, bw_kg: float, male: bool = True) -> float:
         )
     x = bw_kg
     denom = a + b*x + c*x**2 + d*x**3 + e*x**4 + f*x**5
-    if denom <= 0:
-        return 0.0
-    return lift_kg * 500 / denom
+    return lift_kg * 500 / denom if denom > 0 else 0.0
 
 
 def wilks_level(pts: float) -> str:
-    if pts < 150:   return "Rekreacyjny"
-    if pts < 250:   return "Amator"
-    if pts < 350:   return "Dobry amator"
-    if pts < 450:   return "Zaawansowany"
-    if pts < 550:   return "Krajowy poziom"
+    if pts < 150:  return "Rekreacyjny"
+    if pts < 250:  return "Amator"
+    if pts < 350:  return "Dobry amator"
+    if pts < 450:  return "Zaawansowany"
+    if pts < 550:  return "Krajowy poziom"
     return "Elita"
 
 
@@ -78,7 +71,6 @@ def current_bodyweight() -> float | None:
 
 
 def bodyweight_series() -> pd.DataFrame | None:
-    """Zwraca DataFrame z kolumnami date i bw_kg posortowany po dacie."""
     raw = st.session_state.get("pomiary", {})
     pomiary = raw.get("pomiary", [])
     if not pomiary:
@@ -91,31 +83,29 @@ def bodyweight_series() -> pd.DataFrame | None:
 
 
 def merge_bodyweight(df: pd.DataFrame, bw_fallback: float, male: bool) -> pd.DataFrame:
-    """
-    Dla każdego wiersza df (musi mieć kolumnę 'date') przypisuje masę ciała
-    z pomiaru najbliższego w czasie (merge_asof backward).
-    Jeśli brak pomiary.json — używa bw_fallback dla wszystkich dat.
-    Dodaje kolumny 'bw_kg' i 'wilks'.
-    """
+    """Przypisuje masę ciała per data i oblicza wilks oraz pct_bw."""
     df = df.copy()
     bw_df = bodyweight_series()
-
     if bw_df is not None:
-        df_sorted = df.sort_values("date")
-        merged = pd.merge_asof(
-            df_sorted,
-            bw_df,
-            on="date",
-            direction="nearest",
-        )
-        df = merged.sort_values("date")
+        df = pd.merge_asof(
+            df.sort_values("date"), bw_df, on="date", direction="nearest"
+        ).sort_values("date")
     else:
         df["bw_kg"] = bw_fallback
-
-    df["wilks"] = df.apply(
-        lambda r: wilks_points(r["max_1rm"], r["bw_kg"], male), axis=1
-    )
+    df["wilks"]  = df.apply(lambda r: wilks_points(r["max_1rm"], r["bw_kg"], male), axis=1)
+    df["pct_bw"] = df["max_1rm"] / df["bw_kg"] * 100
     return df
+
+
+def zoomed_chart(fig, height=340):
+    """Oś Y zaczyna tuż pod minimum — trendy czytelniejsze."""
+    fig.update_yaxes(rangemode="normal")
+    fig.update_layout(
+        height=height,
+        legend=dict(orientation="h", y=-0.2),
+        hovermode="x unified",
+    )
+    return fig
 
 
 # ── dane ───────────────────────────────────────────────────────────────────
@@ -192,7 +182,7 @@ bw_manual = st.sidebar.number_input(
     min_value=40.0, max_value=200.0,
     value=float(bw_from_file) if bw_from_file else 80.0,
     step=0.5,
-    help="Używana do Wilks Points i wskaźnika siły",
+    help="Używana gdy brak pomiary.json lub jako nadpisanie",
 )
 
 if not selected:
@@ -213,6 +203,15 @@ if ex.empty:
     st.stop()
 
 bw = bw_manual
+
+# ── dane per sesja ─────────────────────────────────────────────────────────
+
+per_day_all = (
+    ex.groupby(["exercise", "date"])
+    .agg(max_weight=("weight_kg", "max"), max_1rm=("est_1rm", "max"), volume=("volume_kg", "sum"))
+    .reset_index()
+)
+per_day_all = merge_bodyweight(per_day_all, bw, male)
 
 # ── nagłówek ───────────────────────────────────────────────────────────────
 
@@ -235,106 +234,62 @@ for col, ex_name in zip(cols, selected):
     pr_1rm    = pr["est_1rm"]
 
     col.markdown(f"#### {ex_name}")
-    col.metric("Rekord (PR)",  f"{pr_weight:.1f} kg × {pr_reps}")
-    col.metric("Est. 1RM",     f"{pr_1rm:.1f} kg",
-               help="Wzór Epley'a: w × (1 + r/30)")
-
-    ratio = pr_1rm / bw
-    col.metric("Siła / masa ciała", f"{ratio:.2f}×")
-
+    col.metric("Rekord (PR)",       f"{pr_weight:.1f} kg × {pr_reps}")
+    col.metric("Est. 1RM",          f"{pr_1rm:.1f} kg", help="Wzór Epley'a: w × (1 + r/30)")
+    col.metric("Siła / masa ciała", f"{pr_1rm / bw * 100:.0f}%",
+               help="Est. 1RM jako % aktualnej masy ciała")
     w_pts = wilks_points(pr_1rm, bw, male)
-    col.metric(
-        "Wilks Points",
-        f"{w_pts:.1f}",
-        delta=wilks_level(w_pts),
-        delta_color="off",
-        help="Wilks = 1RM × 500 / W(masa_ciała). Porównuje siłę między różnymi wagami ciała.",
-    )
+    col.metric("Wilks Points", f"{w_pts:.1f}", delta=wilks_level(w_pts), delta_color="off")
 
 st.divider()
 
-# ── wykres: progres ciężaru (wszystkie wybrane ćwiczenia) ─────────────────
+# ── wykresy — 5 zakładek ───────────────────────────────────────────────────
 
-st.subheader("Progres ciężaru")
+tab_w, tab_1rm, tab_pct, tab_wilks, tab_vol = st.tabs([
+    "Ciężar (kg)", "Est. 1RM (kg)", "% masy ciała", "Wilks Points", "Wolumen",
+])
 
-per_day_all = (
-    ex.groupby(["exercise", "date"])
-    .agg(max_weight=("weight_kg", "max"), max_1rm=("est_1rm", "max"))
-    .reset_index()
-)
+with tab_w:
+    fig = px.line(per_day_all, x="date", y="max_weight", color="exercise", markers=True,
+                  labels={"date": "Data", "max_weight": "Maks. ciężar (kg)", "exercise": "Ćwiczenie"})
+    st.plotly_chart(zoomed_chart(fig), use_container_width=True)
 
-tab1, tab2 = st.tabs(["Maks. ciężar", "Est. 1RM"])
+with tab_1rm:
+    fig = px.line(per_day_all, x="date", y="max_1rm", color="exercise", markers=True,
+                  labels={"date": "Data", "max_1rm": "Est. 1RM (kg)", "exercise": "Ćwiczenie"})
+    st.plotly_chart(zoomed_chart(fig), use_container_width=True)
 
-with tab1:
-    fig_w = px.line(
-        per_day_all, x="date", y="max_weight", color="exercise",
-        markers=True,
-        labels={"date": "Data", "max_weight": "Maks. ciężar (kg)", "exercise": "Ćwiczenie"},
-    )
-    fig_w.update_layout(height=360, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
-    st.plotly_chart(fig_w, use_container_width=True)
+with tab_pct:
+    bw_source = "per data (pomiary.json)" if bodyweight_series() is not None else f"stała {bw:.1f} kg"
+    st.caption(f"Est. 1RM jako % masy ciała ({bw_source}). 100% = ciężar równy masie ciała.")
+    fig = px.line(per_day_all, x="date", y="pct_bw", color="exercise", markers=True,
+                  labels={"date": "Data", "pct_bw": "1RM / masa ciała (%)", "exercise": "Ćwiczenie"})
+    for val, label in [(100, "100% = masa ciała"), (150, "150%"), (200, "200%")]:
+        fig.add_hline(y=val, line_dash="dash", line_color="rgba(255,255,255,0.15)",
+                      annotation_text=label, annotation_position="right")
+    st.plotly_chart(zoomed_chart(fig), use_container_width=True)
 
-with tab2:
-    fig_1rm = px.line(
-        per_day_all, x="date", y="max_1rm", color="exercise",
-        markers=True,
-        labels={"date": "Data", "max_1rm": "Est. 1RM (kg)", "exercise": "Ćwiczenie"},
-    )
-    fig_1rm.update_layout(height=360, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
-    st.plotly_chart(fig_1rm, use_container_width=True)
+with tab_wilks:
+    bw_source = "per data (pomiary.json)" if bodyweight_series() is not None else f"stała {bw:.1f} kg"
+    st.caption(f"Masa ciała: {bw_source}. Wyższa wartość = lepsza siła względna.")
+    fig = px.line(per_day_all, x="date", y="wilks", color="exercise", markers=True,
+                  labels={"date": "Data", "wilks": "Wilks Points", "exercise": "Ćwiczenie"})
+    for poziom, val in [("Amator", 250), ("Zaawansowany", 450), ("Elita", 550)]:
+        fig.add_hline(y=val, line_dash="dash", line_color="rgba(255,255,255,0.2)",
+                      annotation_text=poziom, annotation_position="right")
+    st.plotly_chart(zoomed_chart(fig), use_container_width=True)
 
-# ── Wilks trend ────────────────────────────────────────────────────────────
+with tab_vol:
+    st.caption("Suma (ciężar × powtórzenia) ze wszystkich serii w danej sesji.")
+    fig = px.bar(per_day_all, x="date", y="volume", color="exercise", barmode="group",
+                 labels={"date": "Data", "volume": "Wolumen (kg)", "exercise": "Ćwiczenie"})
+    fig.update_layout(height=340, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
 
-st.divider()
-bw_source = "z pomiary.json (per data)" if bodyweight_series() is not None else f"stała: {bw:.1f} kg (brak pomiary.json)"
-st.subheader(f"Wilks Points w czasie  ·  masa ciała {bw_source}")
-
-per_day_all = merge_bodyweight(per_day_all, bw, male)
-
-fig_wilks = px.line(
-    per_day_all, x="date", y="wilks", color="exercise",
-    markers=True,
-    labels={"date": "Data", "wilks": "Wilks Points", "exercise": "Ćwiczenie"},
-)
-
-for poziom, val in [("Amator", 250), ("Zaawansowany", 450), ("Elita", 550)]:
-    fig_wilks.add_hline(
-        y=val, line_dash="dash", line_color="rgba(255,255,255,0.2)",
-        annotation_text=poziom, annotation_position="right",
-    )
-
-fig_wilks.update_layout(height=340, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
-st.plotly_chart(fig_wilks, use_container_width=True)
-
-# ── wolumen i szczegóły (tylko jedno ćwiczenie) ────────────────────────────
+# ── Top 10 (tylko jedno ćwiczenie) ────────────────────────────────────────
 
 if len(selected) == 1:
-    ex_name = selected[0]
-    df_single = ex[ex["exercise"] == ex_name]
-    per_day_single = (
-        df_single.groupby("date")
-        .agg(max_weight=("weight_kg", "max"), max_1rm=("est_1rm", "max"), volume=("volume_kg", "sum"))
-        .reset_index()
-    )
-
-    st.divider()
-    st.subheader("Wolumen per sesja")
-
-    avg_vol = per_day_single["volume"].mean()
-    fig_vol = go.Figure()
-    fig_vol.add_trace(go.Bar(
-        x=per_day_single["date"], y=per_day_single["volume"],
-        marker_color="#27ae60",
-        hovertemplate="%{x|%d.%m.%Y}<br><b>%{y:,.0f} kg</b><extra></extra>",
-    ))
-    fig_vol.add_hline(
-        y=avg_vol, line_dash="dot",
-        annotation_text=f"średnia {avg_vol:,.0f} kg",
-        annotation_position="top left",
-        line_color="rgba(39,174,96,0.5)",
-    )
-    fig_vol.update_layout(height=300, yaxis_title="kg (ciężar × powtórzenia)")
-    st.plotly_chart(fig_vol, use_container_width=True)
+    df_single = ex[ex["exercise"] == selected[0]]
 
     st.divider()
     st.subheader("Top 10 serii (wg est. 1RM)")
@@ -348,15 +303,17 @@ if len(selected) == 1:
         .assign(Data=lambda d: d["Data"].dt.date)
     )
     top10["Est. 1RM (kg)"] = top10["Est. 1RM (kg)"].round(1)
+
     bw_s = bodyweight_series()
     top10_dates = pd.to_datetime(top10["Data"]).sort_values()
     if bw_s is not None:
         top10_bw = pd.merge_asof(
-            pd.DataFrame({"date": top10_dates}),
-            bw_s, on="date", direction="nearest",
+            pd.DataFrame({"date": top10_dates}), bw_s,
+            on="date", direction="nearest",
         )["bw_kg"].values
     else:
         top10_bw = [bw] * len(top10)
+
     top10["Wilks"] = [
         round(wilks_points(rm, w, male), 1)
         for rm, w in zip(top10["Est. 1RM (kg)"], top10_bw)
