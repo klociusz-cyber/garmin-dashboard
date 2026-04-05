@@ -1,5 +1,5 @@
 """
-Analiza ćwiczeń — rekordy, trendy, 1RM, wskaźnik siły
+Analiza ćwiczeń — rekordy, trendy, 1RM, Wilks Points, wskaźnik siły
 """
 
 import pandas as pd
@@ -21,19 +21,47 @@ def query(sql, params=()):
     return pd.read_sql_query(sql, st.session_state.conn, params=params)
 
 
-# ── 1RM i formuły ──────────────────────────────────────────────────────────
+# ── formuły siłowe ─────────────────────────────────────────────────────────
 
 def epley_1rm(weight: float, reps: int) -> float:
     """Wzór Epley'a: 1RM = w × (1 + r/30)"""
     if reps <= 0:
         return 0.0
-    if reps == 1:
-        return float(weight)
-    return weight * (1 + reps / 30)
+    return float(weight) if reps == 1 else weight * (1 + reps / 30)
+
+
+def wilks_points(lift_kg: float, bw_kg: float, male: bool = True) -> float:
+    """
+    Wilks Points — klasyczny standard siłowy normalizowany względem masy ciała.
+    Źródło: Robert Wilks, IPF (stosowany do 2019).
+    """
+    if male:
+        a, b, c, d, e, f = (
+            -216.0475144, 16.2606339, -0.002388645,
+            -0.00113732, 7.01863e-06, -1.291e-08,
+        )
+    else:
+        a, b, c, d, e, f = (
+            594.31747775582, -27.23842536447, 0.82112226871,
+            -0.00930733913, 4.731582e-05, -9.054e-08,
+        )
+    x = bw_kg
+    denom = a + b*x + c*x**2 + d*x**3 + e*x**4 + f*x**5
+    if denom <= 0:
+        return 0.0
+    return lift_kg * 500 / denom
+
+
+def wilks_level(pts: float) -> str:
+    if pts < 150:   return "Rekreacyjny"
+    if pts < 250:   return "Amator"
+    if pts < 350:   return "Dobry amator"
+    if pts < 450:   return "Zaawansowany"
+    if pts < 550:   return "Krajowy poziom"
+    return "Elita"
 
 
 def best_1rm_row(df: pd.DataFrame):
-    """Zwraca wiersz z najwyższym est. 1RM."""
     if df.empty:
         return None
     df = df.copy()
@@ -41,30 +69,24 @@ def best_1rm_row(df: pd.DataFrame):
     return df.loc[df["est_1rm"].idxmax()]
 
 
-# ── aktualna waga ciała ────────────────────────────────────────────────────
-
 def current_bodyweight() -> float | None:
     raw = st.session_state.get("pomiary", {})
     pomiary = raw.get("pomiary", [])
     if not pomiary:
         return None
-    last = sorted(pomiary, key=lambda x: x.get("data", ""))[-1]
-    return last.get("pomiar_kg")
+    return sorted(pomiary, key=lambda x: x.get("data", ""))[-1].get("pomiar_kg")
 
 
 # ── dane ───────────────────────────────────────────────────────────────────
 
 all_sets = query("""
     SELECT COALESCE(s.exercise_name_pl, s.exercise_name) AS exercise,
-           s.weight_kg,
-           s.repetitions,
-           s.volume_kg,
+           s.weight_kg, s.repetitions, s.volume_kg,
            DATE(w.start_time) AS date
     FROM sets s
     JOIN workouts w ON w.id = s.workout_id
-    WHERE s.set_type   = 'active'
-      AND s.weight_kg  IS NOT NULL
-      AND s.weight_kg  > 0
+    WHERE s.set_type    = 'active'
+      AND s.weight_kg   IS NOT NULL AND s.weight_kg > 0
       AND s.repetitions > 0
     ORDER BY w.start_time
 """)
@@ -74,6 +96,9 @@ if all_sets.empty:
     st.stop()
 
 all_sets["date"] = pd.to_datetime(all_sets["date"])
+all_sets["est_1rm"] = all_sets.apply(
+    lambda r: epley_1rm(r["weight_kg"], r["repetitions"]), axis=1
+)
 
 ex_frequency = (
     all_sets.groupby("exercise")["date"]
@@ -104,168 +129,153 @@ min_sessions = st.sidebar.slider(
     value=max(int(ex_frequency["sessions"].max()) // 3, 2),
 )
 
-main_exercises = ex_frequency[ex_frequency["sessions"] >= min_sessions]["exercise"].tolist()
+main_exercises = ex_frequency[
+    ex_frequency["sessions"] >= min_sessions
+]["exercise"].tolist()
 
-selected = st.sidebar.selectbox(
-    "Ćwiczenie",
+selected = st.sidebar.multiselect(
+    "Ćwiczenia",
     options=main_exercises,
-    index=0,
+    default=main_exercises[:min(3, len(main_exercises))],
+    placeholder="Wybierz ćwiczenia...",
 )
+
+st.sidebar.divider()
+male = st.sidebar.radio("Płeć (Wilks)", ["Mężczyzna", "Kobieta"], index=0) == "Mężczyzna"
+
+if not selected:
+    st.info("Wybierz co najmniej jedno ćwiczenie w menu po lewej.")
+    st.stop()
 
 # ── filtrowanie ────────────────────────────────────────────────────────────
 
 mask = (
-    (all_sets["exercise"] == selected) &
+    all_sets["exercise"].isin(selected) &
     (all_sets["date"].dt.date >= date_from) &
     (all_sets["date"].dt.date <= date_to)
 )
 ex = all_sets[mask].copy()
 
 if ex.empty:
-    st.warning("Brak danych dla wybranego ćwiczenia w tym zakresie dat.")
+    st.warning("Brak danych dla wybranych ćwiczeń w tym zakresie dat.")
     st.stop()
-
-ex["est_1rm"] = ex.apply(lambda r: epley_1rm(r["weight_kg"], r["repetitions"]), axis=1)
-
-# Per sesja: maks ciężar, maks est. 1RM, łączny wolumen
-per_day = (
-    ex.groupby("date")
-    .agg(
-        max_weight=("weight_kg", "max"),
-        max_1rm=("est_1rm", "max"),
-        volume=("volume_kg", "sum"),
-        best_reps=("repetitions", lambda s: s.loc[ex.loc[s.index, "weight_kg"].idxmax()]),
-    )
-    .reset_index()
-)
-
-# ── rekord ─────────────────────────────────────────────────────────────────
-
-pr_row = best_1rm_row(ex)
-pr_weight = pr_row["weight_kg"]
-pr_reps   = int(pr_row["repetitions"])
-pr_1rm    = pr_row["est_1rm"]
-pr_date   = pr_row["date"].date()
 
 bw = current_bodyweight()
 
 # ── nagłówek ───────────────────────────────────────────────────────────────
 
-st.title(f"🏋️ {selected}")
-st.caption(f"Zakres: {date_from} — {date_to}  |  {len(per_day)} sesji treningowych")
+st.title("🏋️ Analiza ćwiczeń")
+st.caption(f"Zakres: {date_from} — {date_to}")
 st.divider()
 
-# ── metryki ────────────────────────────────────────────────────────────────
+# ── metryki per ćwiczenie ──────────────────────────────────────────────────
 
-cols = st.columns(5 if bw else 4)
+cols = st.columns(len(selected))
 
-cols[0].metric(
-    "Rekord (PR)",
-    f"{pr_weight:.1f} kg × {pr_reps}",
-    help="Najlepszy zestaw ciężar × powtórzenia w wybranym okresie",
+for col, ex_name in zip(cols, selected):
+    df_ex = ex[ex["exercise"] == ex_name]
+    pr = best_1rm_row(df_ex)
+    if pr is None:
+        continue
+
+    pr_weight = pr["weight_kg"]
+    pr_reps   = int(pr["repetitions"])
+    pr_1rm    = pr["est_1rm"]
+
+    col.markdown(f"#### {ex_name}")
+    col.metric("Rekord (PR)",  f"{pr_weight:.1f} kg × {pr_reps}")
+    col.metric("Est. 1RM",     f"{pr_1rm:.1f} kg",
+               help="Wzór Epley'a: w × (1 + r/30)")
+
+    if bw:
+        ratio = pr_1rm / bw
+        col.metric("Siła / masa ciała", f"{ratio:.2f}×")
+
+        w_pts = wilks_points(pr_1rm, bw, male)
+        col.metric(
+            "Wilks Points",
+            f"{w_pts:.1f}",
+            delta=wilks_level(w_pts),
+            delta_color="off",
+            help="Wilks = 1RM × 500 / W(masa_ciała). Porównuje siłę między różnymi wagami ciała.",
+        )
+
+st.divider()
+
+# ── wykres: progres ciężaru (wszystkie wybrane ćwiczenia) ─────────────────
+
+st.subheader("Progres ciężaru")
+
+per_day_all = (
+    ex.groupby(["exercise", "date"])
+    .agg(max_weight=("weight_kg", "max"), max_1rm=("est_1rm", "max"))
+    .reset_index()
 )
-cols[1].metric(
-    "Est. 1RM",
-    f"{pr_1rm:.1f} kg",
-    help="Szacowany maksymalny ciężar na 1 powtórzenie (wzór Epley'a)",
-)
-cols[2].metric(
-    "Data PR",
-    str(pr_date),
-)
-cols[3].metric(
-    "Łączny wolumen",
-    f"{ex['volume_kg'].sum():,.0f} kg",
-    help="Suma (ciężar × powtórzenia) ze wszystkich serii w okresie",
-)
+
+tab1, tab2 = st.tabs(["Maks. ciężar", "Est. 1RM"])
+
+with tab1:
+    fig_w = px.line(
+        per_day_all, x="date", y="max_weight", color="exercise",
+        markers=True,
+        labels={"date": "Data", "max_weight": "Maks. ciężar (kg)", "exercise": "Ćwiczenie"},
+    )
+    fig_w.update_layout(height=360, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
+    st.plotly_chart(fig_w, use_container_width=True)
+
+with tab2:
+    fig_1rm = px.line(
+        per_day_all, x="date", y="max_1rm", color="exercise",
+        markers=True,
+        labels={"date": "Data", "max_1rm": "Est. 1RM (kg)", "exercise": "Ćwiczenie"},
+    )
+    fig_1rm.update_layout(height=360, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
+    st.plotly_chart(fig_1rm, use_container_width=True)
+
+# ── Wilks trend (jeśli jest masa ciała) ───────────────────────────────────
 
 if bw:
-    ratio = pr_1rm / bw
+    st.divider()
+    st.subheader(f"Wilks Points w czasie  ·  masa ciała: {bw:.1f} kg")
 
-    if ratio < 0.75:
-        poziom = "Początkujący"
-    elif ratio < 1.0:
-        poziom = "Nowicjusz"
-    elif ratio < 1.5:
-        poziom = "Średniozaawansowany"
-    elif ratio < 2.0:
-        poziom = "Zaawansowany"
-    else:
-        poziom = "Elita"
-
-    cols[4].metric(
-        "Wskaźnik siły",
-        f"{ratio:.2f}×",
-        delta=poziom,
-        delta_color="off",
-        help=f"Est. 1RM ({pr_1rm:.1f} kg) ÷ masa ciała ({bw:.1f} kg)",
+    per_day_all["wilks"] = per_day_all["max_1rm"].apply(
+        lambda x: wilks_points(x, bw, male)
     )
 
-st.divider()
-
-# ── wykres 1: progres ciężaru ──────────────────────────────────────────────
-
-col_l, col_r = st.columns(2)
-
-with col_l:
-    st.subheader("Progres ciężaru")
-
-    fig_weight = go.Figure()
-    fig_weight.add_trace(go.Scatter(
-        x=per_day["date"], y=per_day["max_weight"],
-        mode="lines+markers",
-        name="Maks. ciężar",
-        line=dict(color="#3498db", width=2),
-        marker=dict(size=6),
-        hovertemplate="%{x|%d.%m.%Y}<br><b>%{y:.1f} kg</b><extra></extra>",
-    ))
-    fig_weight.add_trace(go.Scatter(
-        x=per_day["date"], y=per_day["max_1rm"],
-        mode="lines",
-        name="Est. 1RM",
-        line=dict(color="#9b59b6", width=2, dash="dot"),
-        hovertemplate="%{x|%d.%m.%Y}<br>Est. 1RM: <b>%{y:.1f} kg</b><extra></extra>",
-    ))
-
-    # Linia PR
-    fig_weight.add_hline(
-        y=pr_1rm, line_dash="dot",
-        annotation_text=f"PR est. 1RM: {pr_1rm:.1f} kg",
-        annotation_position="top left",
-        line_color="rgba(155,89,182,0.4)",
+    fig_wilks = px.line(
+        per_day_all, x="date", y="wilks", color="exercise",
+        markers=True,
+        labels={"date": "Data", "wilks": "Wilks Points", "exercise": "Ćwiczenie"},
     )
 
-    fig_weight.update_layout(
-        height=350,
-        legend=dict(orientation="h", y=-0.2),
-        yaxis_title="kg",
-        xaxis_title="",
-        hovermode="x unified",
+    # Linie poziomów
+    for poziom, val in [("Amator", 250), ("Zaawansowany", 450), ("Elita", 550)]:
+        fig_wilks.add_hline(
+            y=val, line_dash="dash", line_color="rgba(255,255,255,0.2)",
+            annotation_text=poziom, annotation_position="right",
+        )
+
+    fig_wilks.update_layout(height=340, legend=dict(orientation="h", y=-0.2), hovermode="x unified")
+    st.plotly_chart(fig_wilks, use_container_width=True)
+
+# ── wolumen i szczegóły (tylko jedno ćwiczenie) ───────────────────────────
+
+if len(selected) == 1:
+    ex_name = selected[0]
+    df_single = ex[ex["exercise"] == ex_name]
+    per_day_single = (
+        df_single.groupby("date")
+        .agg(max_weight=("weight_kg", "max"), max_1rm=("est_1rm", "max"), volume=("volume_kg", "sum"))
+        .reset_index()
     )
-    st.plotly_chart(fig_weight, use_container_width=True)
 
-# ── wykres 2: wolumen ──────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Wolumen per sesja")
 
-with col_r:
-    st.subheader("Wolumen per sesja (kg)")
-
-    avg_vol = per_day["volume"].mean()
-    vol_delta, vol_dir = None, "normal"
-    if len(per_day) >= 4:
-        mid = len(per_day) // 2
-        a1  = per_day["volume"].iloc[:mid].mean()
-        a2  = per_day["volume"].iloc[mid:].mean()
-        if a1 > 0:
-            pct = (a2 - a1) / a1 * 100
-            vol_delta = f"{'+' if pct >= 0 else ''}{pct:.1f}%"
-            vol_dir   = "normal" if pct >= 0 else "inverse"
-
-    st.metric("Trend wolumenu (1. vs 2. połowa)", "", delta=vol_delta, delta_color=vol_dir or "normal")
-
+    avg_vol = per_day_single["volume"].mean()
     fig_vol = go.Figure()
     fig_vol.add_trace(go.Bar(
-        x=per_day["date"], y=per_day["volume"],
-        name="Wolumen",
+        x=per_day_single["date"], y=per_day_single["volume"],
         marker_color="#27ae60",
         hovertemplate="%{x|%d.%m.%Y}<br><b>%{y:,.0f} kg</b><extra></extra>",
     ))
@@ -275,70 +285,23 @@ with col_r:
         annotation_position="top left",
         line_color="rgba(39,174,96,0.5)",
     )
-    fig_vol.update_layout(
-        height=320,
-        yaxis_title="kg",
-        xaxis_title="",
-    )
+    fig_vol.update_layout(height=300, yaxis_title="kg (ciężar × powtórzenia)")
     st.plotly_chart(fig_vol, use_container_width=True)
 
-# ── wskaźnik siły – kontekst ───────────────────────────────────────────────
-
-if bw:
     st.divider()
-    st.subheader("Wskaźnik siły na tle masy ciała")
+    st.subheader("Top 10 serii (wg est. 1RM)")
 
-    ratio_history = per_day.copy()
-    ratio_history["wskaznik"] = ratio_history["max_1rm"] / bw
-
-    fig_ratio = go.Figure()
-    fig_ratio.add_trace(go.Scatter(
-        x=ratio_history["date"], y=ratio_history["wskaznik"],
-        mode="lines+markers",
-        line=dict(color="#f39c12", width=2),
-        marker=dict(size=6),
-        hovertemplate="%{x|%d.%m.%Y}<br>Wskaźnik: <b>%{y:.2f}×</b><extra></extra>",
-    ))
-
-    # Poziomy referencyjne
-    for poziom, val, col in [
-        ("Nowicjusz",            1.0, "rgba(52,152,219,0.15)"),
-        ("Średniozaawansowany",  1.5, "rgba(46,204,113,0.15)"),
-        ("Zaawansowany",         2.0, "rgba(231,76,60,0.15)"),
-    ]:
-        fig_ratio.add_hline(
-            y=val, line_dash="dash", line_color="rgba(255,255,255,0.2)",
-            annotation_text=poziom,
-            annotation_position="right",
+    top10 = (
+        df_single.nlargest(10, "est_1rm")[["date", "weight_kg", "repetitions", "est_1rm"]]
+        .rename(columns={
+            "date": "Data", "weight_kg": "Ciężar (kg)",
+            "repetitions": "Powtórzenia", "est_1rm": "Est. 1RM (kg)",
+        })
+        .assign(Data=lambda d: d["Data"].dt.date)
+    )
+    top10["Est. 1RM (kg)"] = top10["Est. 1RM (kg)"].round(1)
+    if bw:
+        top10["Wilks"] = top10["Est. 1RM (kg)"].apply(
+            lambda x: round(wilks_points(x, bw, male), 1)
         )
-
-    fig_ratio.update_layout(
-        height=300,
-        yaxis_title="Est. 1RM / masa ciała",
-        xaxis_title="",
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_ratio, use_container_width=True)
-    st.caption(
-        f"Masa ciała: **{bw:.1f} kg** (ostatni pomiar z Fitatu). "
-        "Poziomy referencyjne dla ruchów wielostawowych (przysiad, martwy ciąg, wyciskanie)."
-    )
-
-# ── tabela najlepszych serii ───────────────────────────────────────────────
-
-st.divider()
-st.subheader("Top 10 serii (wg est. 1RM)")
-
-top10 = (
-    ex.nlargest(10, "est_1rm")[["date", "weight_kg", "repetitions", "est_1rm"]]
-    .rename(columns={
-        "date":       "Data",
-        "weight_kg":  "Ciężar (kg)",
-        "repetitions":"Powtórzenia",
-        "est_1rm":    "Est. 1RM (kg)",
-    })
-    .assign(**{"Data": lambda d: d["Data"].dt.date})
-)
-top10["Est. 1RM (kg)"] = top10["Est. 1RM (kg)"].round(1)
-
-st.dataframe(top10, use_container_width=True, hide_index=True)
+    st.dataframe(top10, use_container_width=True, hide_index=True)
