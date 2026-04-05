@@ -97,6 +97,31 @@ def merge_bodyweight(df: pd.DataFrame, bw_fallback: float, male: bool) -> pd.Dat
     return df
 
 
+def period_trend(df_ex: pd.DataFrame, days: int) -> float | None:
+    """
+    Porównuje max est_1rm z ostatnich `days` dni vs poprzedni taki sam okres.
+    Zwraca % zmiany lub None jeśli brak danych w którymś z okresów.
+    """
+    today = df_ex["date"].max()
+    cur = df_ex[df_ex["date"] >= today - pd.Timedelta(days=days)]["est_1rm"].max()
+    prv = df_ex[
+        (df_ex["date"] >= today - pd.Timedelta(days=2 * days)) &
+        (df_ex["date"] <  today - pd.Timedelta(days=days))
+    ]["est_1rm"].max()
+    if pd.isna(cur) or pd.isna(prv) or prv == 0:
+        return None
+    return (cur - prv) / prv * 100
+
+
+def trend_badge(pct: float | None) -> str:
+    """Zwraca kolorowy znacznik trendu w markdown."""
+    if pct is None:
+        return "—"
+    color = "green" if pct >= 0 else "red"
+    sign  = "+" if pct >= 0 else ""
+    return f":{color}[{sign}{pct:.1f}%]"
+
+
 def zoomed_chart(fig, height=340):
     """Oś Y zaczyna tuż pod minimum — trendy czytelniejsze."""
     fig.update_yaxes(rangemode="normal")
@@ -240,6 +265,16 @@ for col, ex_name in zip(cols, selected):
                help="Est. 1RM jako % aktualnej masy ciała")
     w_pts = wilks_points(pr_1rm, bw, male)
     col.metric("Wilks Points", f"{w_pts:.1f}", delta=wilks_level(w_pts), delta_color="off")
+
+    t1w = period_trend(df_ex, 7)
+    t1m = period_trend(df_ex, 30)
+    t3m = period_trend(df_ex, 90)
+    col.markdown(
+        f"**Trend 1RM** (est.)  \n"
+        f"&nbsp;&nbsp;1T: {trend_badge(t1w)}&nbsp;&nbsp;"
+        f"1M: {trend_badge(t1m)}&nbsp;&nbsp;"
+        f"3M: {trend_badge(t3m)}"
+    )
 
 st.divider()
 
