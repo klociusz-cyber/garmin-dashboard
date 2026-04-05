@@ -97,17 +97,19 @@ def merge_bodyweight(df: pd.DataFrame, bw_fallback: float, male: bool) -> pd.Dat
     return df
 
 
-def period_trend(df_ex: pd.DataFrame, days: int) -> float | None:
+def period_trend(df: pd.DataFrame, col: str, days: int, agg: str = "max") -> float | None:
     """
-    Porównuje max est_1rm z ostatnich `days` dni vs poprzedni taki sam okres.
-    Zwraca % zmiany lub None jeśli brak danych w którymś z okresów.
+    Porównuje wartość kolumny `col` z ostatnich `days` dni vs poprzedni taki sam okres.
+    agg: 'max' lub 'sum'
+    Zwraca % zmiany lub None jeśli brak danych.
     """
-    today = df_ex["date"].max()
-    cur = df_ex[df_ex["date"] >= today - pd.Timedelta(days=days)]["est_1rm"].max()
-    prv = df_ex[
-        (df_ex["date"] >= today - pd.Timedelta(days=2 * days)) &
-        (df_ex["date"] <  today - pd.Timedelta(days=days))
-    ]["est_1rm"].max()
+    today = df["date"].max()
+    fn = pd.Series.max if agg == "max" else pd.Series.sum
+    cur = fn(df[df["date"] >= today - pd.Timedelta(days=days)][col])
+    prv = fn(df[
+        (df["date"] >= today - pd.Timedelta(days=2 * days)) &
+        (df["date"] <  today - pd.Timedelta(days=days))
+    ][col])
     if pd.isna(cur) or pd.isna(prv) or prv == 0:
         return None
     return (cur - prv) / prv * 100
@@ -266,15 +268,50 @@ for col, ex_name in zip(cols, selected):
     w_pts = wilks_points(pr_1rm, bw, male)
     col.metric("Wilks Points", f"{w_pts:.1f}", delta=wilks_level(w_pts), delta_color="off")
 
-    t1w = period_trend(df_ex, 7)
-    t1m = period_trend(df_ex, 30)
-    t3m = period_trend(df_ex, 90)
-    col.markdown(
-        f"**Trend 1RM** (est.)  \n"
-        f"&nbsp;&nbsp;1T: {trend_badge(t1w)}&nbsp;&nbsp;"
-        f"1M: {trend_badge(t1m)}&nbsp;&nbsp;"
-        f"3M: {trend_badge(t3m)}"
+    # Dodaj masę ciała per datę do df_ex
+    bw_s = bodyweight_series()
+    if bw_s is not None:
+        df_ex_bw = pd.merge_asof(
+            df_ex.sort_values("date"), bw_s, on="date", direction="nearest"
+        )
+    else:
+        df_ex_bw = df_ex.copy()
+        df_ex_bw["bw_kg"] = bw
+    df_ex_bw["1rm_pct_bw"]  = df_ex_bw["est_1rm"]   / df_ex_bw["bw_kg"] * 100
+    df_ex_bw["vol_pct_bw"]  = df_ex_bw["volume_kg"]  / df_ex_bw["bw_kg"] * 100
+
+    # Per sesja (do trendów wolumenu)
+    per_ses = (
+        df_ex_bw.groupby("date")
+        .agg(
+            est_1rm=("est_1rm", "max"),
+            volume_kg=("volume_kg", "sum"),
+            bw_kg=("bw_kg", "mean"),
+        )
+        .reset_index()
     )
+    per_ses["1rm_pct_bw"] = per_ses["est_1rm"]  / per_ses["bw_kg"] * 100
+    per_ses["vol_pct_bw"] = per_ses["volume_kg"] / per_ses["bw_kg"] * 100
+
+    def tr(metric, agg="max"):
+        return (
+            period_trend(per_ses, metric, 7,  agg),
+            period_trend(per_ses, metric, 30, agg),
+            period_trend(per_ses, metric, 90, agg),
+        )
+
+    def trend_row(label, t1w, t1m, t3m):
+        col.markdown(
+            f"**{label}**  \n"
+            f"&nbsp;&nbsp;1T:&nbsp;{trend_badge(t1w)}"
+            f"&ensp;1M:&nbsp;{trend_badge(t1m)}"
+            f"&ensp;3M:&nbsp;{trend_badge(t3m)}"
+        )
+
+    trend_row("Trend 1RM (est.)",          *tr("est_1rm"))
+    trend_row("Trend 1RM / masa ciała",    *tr("1rm_pct_bw"))
+    trend_row("Trend wolumenu",            *tr("volume_kg", "sum"))
+    trend_row("Trend wolumenu / masa ciała", *tr("vol_pct_bw", "sum"))
 
 st.divider()
 
