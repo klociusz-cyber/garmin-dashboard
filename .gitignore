@@ -1,0 +1,16 @@
+# Dane osobiste - nie wgrywaj na GitHub
+data/
+fit_files/
+monitor_files/
+fitatu/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Środowisko
+.env
+venv/
+.venv/
